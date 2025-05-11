@@ -1,27 +1,33 @@
 from concurrent import futures
-import threading
 from typing import Dict, List, Literal, Set
 from waybackpy import WaybackMachineCDXServerAPI
 from tqdm import tqdm
 import requests
 from lxml import etree
-import json
 import os
-from concurrent.futures import ThreadPoolExecutor, Future, CancelledError
+from concurrent.futures import ThreadPoolExecutor, Future
 from threading import RLock, Lock
 from gne import GeneralNewsExtractor
 import traceback
 from datetime import datetime
 import time
-import urllib3
 import signal
 import zipfile
-from dataclasses import dataclass
+from Jackdaw.Utils import get_real_url, trim_article_url, trim_main_url, all_not_in
+from Jackdaw.Parser import *
 
 proxies = { 
               "http"  : "http://127.0.0.1:8010", 
               "https" : "http://127.0.0.1:8010",
             }
+
+def html_has_encoding(text: str) -> bool:
+    if text.startswith('<?xml version="1.0" encoding="'):
+        return True
+    if text.find('http-equiv="Content-Type" content="text/html; charset=', 0, 1000) != -1:
+        return True
+    return False
+
 
 def request(url: str, proxy: Dict[str, str]):
     err = None
@@ -29,7 +35,7 @@ def request(url: str, proxy: Dict[str, str]):
         try:
             r = requests.get(url, proxies=proxy)
             r.encoding = r.apparent_encoding
-            if r.text.startswith('<?xml version="1.0" encoding="'):
+            if html_has_encoding(r.text):
                 return r
             r.encoding = 'gb2312'
             return r
@@ -63,30 +69,6 @@ def get_main_pages():
     with open(cache_dir, 'r') as f:
         return f.read().split("\n")
 
-base_url_prefix = 'https://web.archive.org/web/'
-
-
-def trim_main_url(url: str) -> str:
-    '''
-    'https://web.archive.org/web/20120101175409/http://finance.sina.com.cn/'
-    '''
-    idx = url.find("/http:", len(base_url_prefix))
-    return url[len(base_url_prefix):idx]
-
-def trim_article_url(url: str) -> str:
-    '''
-    'https://web.archive.org/web/20120205053606/http://finance.sina.com.cn/roll/20120202/044211294946.shtml'
-    '''
-    assert(url.startswith(base_url_prefix))
-    return url[len(base_url_prefix)+len("20120205053606/http://"):]
-
-def get_real_url(url: str) -> str:
-    idx = url.find("http", len(base_url_prefix))
-    return url[idx:]
-
-def do_assert(url, v):
-    if not v:
-        raise RuntimeError("failed at "+ url)
 
 def fetch_page_or_fallback(url, fn):
     r = request(get_real_url(url), {})
@@ -98,14 +80,13 @@ def fetch_page_or_fallback(url, fn):
             redo_url = r.text[idx+len(anchor): idx2]
             print("Redirect to:", redo_url)
             r = request(redo_url, {})
-        elif "<TITLE> 页面没有找到 </TITLE>" in r.text:
+        elif "<TITLE> 页面没有找到 " in r.text:
             r = request(url, proxies)
         else:
             with open(f"out/err_{fn}.html", 'w', encoding="utf-8") as f:
                 f.write(r.text)
             raise RuntimeError(f"Unknown page {url}")
     return r
-
 
 class MainPage:
     def __init__(self, url: str, num_news: int):
@@ -132,7 +113,7 @@ class Context:
         self.ziplock = Lock()
         self.allowed_short = file_to_list("out/sina/allow_short.txt")
         self.bad_content_count = 0
-        self.parsers = [Parser2012_v3, Parser2012_v1, Parser2012_v2]
+        self.parsers = [Parser2013_v1, Parser2012_v3, Parser2012_v1, Parser2012_v2]
         with open("out/sina/bad_content.txt", 'a') as f:
             f.write("=======\n")
 
@@ -212,18 +193,25 @@ class Context:
                         '//a[@href="http://news.sina.com.cn/437/2008/0703/30.html"]',
                         '//a[@href="http://guba.sina.com.cn"]',
                         '//a[text()="微博推荐"]',
-                        '//table[@class="tb01"]/tbody'
+                        '//a[text()="[微博]"]',
+                        '//table[@class="tb01"]/tbody',
+                        '//div[@id="title_gi"]',
+                        '//dl[@id="dl_gi"]',
+                        '//div[@class="content_aboutNews clearfix"]'
                         ])
                 except Exception as e:
                     with open(f"out/err_{fn}.html", 'w', encoding="utf-8") as f:
                         f.write(r.text)
                     raise e
-                not_found_str = ["页面没有找到 5秒钟之后将会带", "The Wayback Machine"]
-                if all(map(lambda x: x not in result["content"], not_found_str)):
-                    if sum([result["content"].count(x) for x in "，。%；、："]) < 3 and trimed not in self.allowed_short:
-                        self._write_bad_page(url, result['content'])
-                        time.sleep(2)
-                        return "Resume"
+                not_found_str = ["页面没有找到 5秒钟之后将会带", "Wayback Machine"]
+                must_be_ok = ["中国人民银行公开市场业务操作室"]
+                if all_not_in(not_found_str, result["content"]):
+                    if sum([result["content"].count(x) for x in "，。%；、："]) < 3 \
+                        and trimed not in self.allowed_short \
+                        and all_not_in(must_be_ok, result["content"]):
+                            self._write_bad_page(url, result['content'])
+                            time.sleep(2)
+                            return "Resume"
                     try:
                         date = datetime.strptime(result["publish_time"], "%Y年%m月%d日 %H:%M")
                     except ValueError:
@@ -281,9 +269,9 @@ class Context:
             else:
                 print(f"Bad main and try to resume:{url}")
                 self._write_bad_page(url, "main")
-                time.sleep(7)
+                time.sleep(10)
                 return "Resume"
-            time.sleep(7)
+            time.sleep(10)
             return url
         except:
             traceback.print_exc()
@@ -300,96 +288,6 @@ class Context:
                     continue
                 self.main_fut.add(self.exec_main.submit(self._task_main_page, self.mainurls[cur]))
 
-@dataclass
-class ParseResult:
-    tag: Literal["good", "bad", "skip"]
-    result: List[str]
-
-class Parser2012:
-    @staticmethod
-    def is_2012(tree, text, matchxpath) -> Literal["good", "bad", "skip"]:
-        if tree.xpath(matchxpath).__len__() == 1:
-            return "good"
-        if "新浪提示您：普通用户手机建议选择" in text:
-            return "skip"
-        return "bad"
-    @staticmethod
-    def parse_2012(url: str, tree, matchxpath: str, tags: List[str]):
-        # anchor = tree.xpath('//ul[@id="shFinanceX"]')
-        # do_assert(url, anchor.__len__() == 1)
-        # anchor: etree._Element = anchor[0]
-        # query = anchor.xpath("li/a/@href")
-        # do_assert(url, query)
-        # urls: List[str] = query
-        # query = anchor.getparent().xpath('div[@class="PicTxt"]/div[@class="Txt"]/h4/a/@href')
-        # do_assert(url, query)
-        # urls.extend(query)
-        urls: List[str] = []
-        # international
-        def work(tag: str):
-            anchor = tree.xpath(matchxpath.format(tag=tag))
-            do_assert(url, anchor.__len__() == 1)
-            anchor: etree._Element = anchor[0]
-            anchor = anchor.getparent().getparent().getparent().getparent().xpath('div[@class="blk_14"]')
-            do_assert(url, anchor.__len__() == 1)
-            anchor: etree._Element = anchor[0]
-            query = anchor.xpath('div[@class="PicTxt"]/div[@class="Txt"]/h4/a/@href')
-            do_assert(url, query)
-            urls.extend(query)
-
-            query = anchor.xpath('ul[@class="list_009"]/li/a/@href')
-            do_assert(url, query)
-            urls.extend(query)
-        for tag in tags:
-            work(tag)
-        if urls[0].endswith("world/index.shtml") or urls[0].endswith("finance.sina.com.cn/world/"):
-            del urls[0]
-        return urls
-    
-
-class Parser2012_v1:
-    @staticmethod
-    def is_it(url: str, tree, text: str):
-        return Parser2012.is_2012(tree, text, '//h2[@class="Title_05 TS_05_01"]/span/a/img[@alt="国际"]')
-
-    @staticmethod
-    def parse(url: str, tree):
-        return Parser2012.parse_2012(url, tree, '//h2[@class="Title_05 TS_05_01"]/span/a/img[@alt="{tag}"]', ["国际", "国内"])
-
-class Parser2012_v2:
-    @staticmethod
-    def is_it(url: str, tree, text: str):
-        base = trim_main_url(url)
-        return Parser2012.is_2012(tree, text, f'//h2[@class="Title_05 TS_05_01"]/span/a[@href="https://web.archive.org/web/{base}/http://finance.sina.com.cn/china/"]')
-
-    @staticmethod
-    def parse(url: str, tree):
-        base = trim_main_url(url)
-        templ = f'//h2[@class="Title_05 TS_05_01"]/span/a[@href="https://web.archive.org/web/{base}/http://finance.sina.com.cn/{{tag}}/"]'
-        return Parser2012.parse_2012(url, tree, templ, ["china", "world"])
-
-class Parser2012_v3:
-    @staticmethod
-    def is_it(url, tree, text):
-        if tree.xpath('//div[@class="news_inland"]//div[@class="news_inland_c"]').__len__() == 1:
-            return "good"
-        return "bad"
-    
-    @staticmethod
-    def parse(url: str, tree):
-        parsed = tree.xpath('//div[@class="news_inland"]//div[@class="news_inland_c"]/div/div/h4/a/@href')
-        do_assert(url, len(parsed) == 1)
-        urls = parsed
-        parsed = tree.xpath('//div[@class="news_inland"]//div[@class="news_inland_c"]/ul/li/a/@href')
-        do_assert(url, len(parsed) > 1)
-        urls.extend(parsed)
-        parsed = tree.xpath('//div[@class="news_inter"]//div[@class="news_inland_c"]/div/div/h4/a/@href')
-        do_assert(url, len(parsed) == 1)
-        urls.extend(parsed)
-        parsed = tree.xpath('//div[@class="news_inter"]//div[@class="news_inland_c"]/ul/li/a/@href')
-        do_assert(url, len(parsed) > 1)
-        urls.extend(parsed)
-        return urls
 
 ctx = Context()
 def handler(signum, frame):
