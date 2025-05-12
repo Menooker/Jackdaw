@@ -1,4 +1,5 @@
 from concurrent import futures
+import threading
 from typing import Dict, List, Literal, Set
 from waybackpy import WaybackMachineCDXServerAPI
 from tqdm import tqdm
@@ -33,9 +34,9 @@ def request(url: str, proxy: Dict[str, str]):
     err = None
     for i in range(5):
         try:
-            r = requests.get(url, proxies=proxy)
+            r = requests.get(url, proxies=proxy, timeout=60)
             r.encoding = r.apparent_encoding
-            if html_has_encoding(r.text):
+            if r.encoding == 'utf-8' or html_has_encoding(r.text):
                 return r
             r.encoding = 'gb2312'
             return r
@@ -80,12 +81,13 @@ def fetch_page_or_fallback(url, fn):
             redo_url = r.text[idx+len(anchor): idx2]
             print("Redirect to:", redo_url)
             r = request(redo_url, {})
-        elif "<TITLE> 页面没有找到 " in r.text:
+        elif "<TITLE> 页面没有找到 " in r.text or "<body></body>" in r.text or not r.text:
             r = request(url, proxies)
         else:
             with open(f"out/err_{fn}.html", 'w', encoding="utf-8") as f:
                 f.write(r.text)
-            raise RuntimeError(f"Unknown page {url}")
+            ctx._write_bad_page(url, f"Unknown page out/err_{fn}.html")
+            return None
     return r
 
 class MainPage:
@@ -121,13 +123,21 @@ class Context:
         print("Calling shutdown")
         self.exec_main.shutdown(wait=False, cancel_futures=True)
         self.exec_work.shutdown(wait=False, cancel_futures=True)
-        print("Waiting for page workers")
-        self.exec_work.shutdown(wait=True)
-        self.outzip.close()
-        print("page worker exits, waiting for main")
-        self.exec_main.shutdown(wait=True)
-        self.done_article_log.close()
-        self.done_main_log.close()
+        print("Waiting for workers, timeout 180...")
+        def exitfunc():
+            self.exec_work.shutdown(wait=True)
+            self.exec_main.shutdown(wait=True)
+        wait_close = threading.Thread(target=exitfunc, daemon=True)
+        wait_close.start()
+        try:
+            wait_close.join(timeout=180)
+        except TimeoutError:
+            print("Timeout")
+            exit(2)
+        finally:
+            self.done_article_log.close()
+            self.done_main_log.close()
+            self.outzip.close()
         print("shutdown done")
     
     def _on_main_done(self, pid):
@@ -185,6 +195,9 @@ class Context:
                 trimed = trim_article_url(url)
                 fn = trimed.replace(":", "-.").replace("/", "--")
                 r = fetch_page_or_fallback(url, fn)
+                if r is None:
+                    time.sleep(2)
+                    return "Resume"
                 extractor = GeneralNewsExtractor()
                 try:
                     result = extractor.extract(r.text, noise_node_list=['//div[@class="blkContentFooter"]',
@@ -193,18 +206,35 @@ class Context:
                         '//a[@href="http://news.sina.com.cn/437/2008/0703/30.html"]',
                         '//a[@href="http://guba.sina.com.cn"]',
                         '//a[text()="微博推荐"]',
-                        '//a[text()="[微博]"]',
                         '//table[@class="tb01"]/tbody',
                         '//div[@id="title_gi"]',
                         '//dl[@id="dl_gi"]',
-                        '//div[@class="content_aboutNews clearfix"]'
+                        '//div[@class="content_aboutNews clearfix"]',
+                        '//div[@class="page-footer"]',
+                        '//div[@class="ad_content ad_06 adNone"]',
+                        '//div[@class="article-keywords"]',
+                        '//div[@class="article-feedback"]',
+                        '//div[@class="feed-wrap"]',
+                        '//div[@class="sina-comment-wrap"]',
+                        '//div[@class="page-tools"]',
+                        '//div[@class="zhitou-wrap"]',
                         ])
+                    tree = etree.HTML(r.text)
+                    table = tree.xpath('//table[@class="tb01"]')
+                    table_text = ""
+                    if len(table) == 1:
+                        table_text = " ".join(table[0].xpath('tbody/tr/td/text()'))
                 except Exception as e:
                     with open(f"out/err_{fn}.html", 'w', encoding="utf-8") as f:
                         f.write(r.text)
                     raise e
+                # patch the data
+                result["content"] = result["content"].replace("[微博]", "")
+                if table_text:
+                    result["content"] += "\n" + table_text
                 not_found_str = ["页面没有找到 5秒钟之后将会带", "Wayback Machine"]
-                must_be_ok = ["中国人民银行公开市场业务操作室"]
+                must_be_ok = ["中国人民银行公开市场业务操作室", "接受组织调查", "正回购",
+                    "省纪委", "逆回购", "今日未进行公开市场操作"]
                 if all_not_in(not_found_str, result["content"]):
                     if sum([result["content"].count(x) for x in "，。%；、："]) < 3 \
                         and trimed not in self.allowed_short \
@@ -212,10 +242,23 @@ class Context:
                             self._write_bad_page(url, result['content'])
                             time.sleep(2)
                             return "Resume"
-                    try:
-                        date = datetime.strptime(result["publish_time"], "%Y年%m月%d日 %H:%M")
-                    except ValueError:
-                        date = datetime.strptime(result["publish_time"], "%Y-%m-%d %H:%M")
+                    timestr = result["publish_time"]
+                    # parse ISO timestamp '2014-10-01T17:19:43+08:00'
+                    if "+" in timestr:
+                        timestr = timestr[:timestr.find("+")]
+                    date_fmt = ["%Y年%m月%d日 %H:%M", "%Y-%m-%d %H:%M",
+                        "%Y-%m-%d %H:%M:%S", "%Y年%m月%d日 %H:%M:%S", '%Y-%m-%dT%H:%M:%S']
+                    err = None
+                    for fmt in date_fmt:
+                        try:
+                            date = datetime.strptime(timestr, fmt)
+                            break
+                        except ValueError as e:
+                            err = e
+                    else:
+                        self._write_bad_page(url, str(err))
+                        time.sleep(2)
+                        return "Resume"
                     data = "[sepsep]".join([result["title"], result["author"], date.strftime("%Y/%m/%d %H:%M"), result["content"]])
                     base = f"{date.year}/{date.month}/{date.day}/{date.hour:02d}/{date.minute:02d}"
                     # os.makedirs(base, exist_ok=True)
@@ -318,6 +361,7 @@ for _ in range(1):
                 ret = None
             if ret is None:
                 ctx.close()
+                print("Error occured, exiting")
                 exit(2)
             with ctx.lock:
                 ctx.main_fut.remove(fut)
