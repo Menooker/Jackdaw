@@ -11,6 +11,10 @@ class Parser2013_v1:
         if tree.xpath('//div[@data-sudaclick="blk_newsinter_01"]/ul').__len__() == 1 \
             and tree.xpath('//div[@data-sudaclick="blk_newsinland_01"]/ul').__len__() == 1:
             return "good"
+        if "The Wayback Machine is a" in text:
+            return "skip"
+        if tree.xpath('//p[@class="submit"]/a[text()="直接回旧版"]'):
+            return "skip"
         return "bad"
     
     @staticmethod
@@ -21,4 +25,5 @@ class Parser2013_v1:
         parsed = tree.xpath('//div[@data-sudaclick="blk_newsinland_01"]/ul/li/a/@href')
         do_assert(url, len(parsed) >= 3)
         urls.extend(parsed)
+        urls = [x for x in urls if all_not_in(["http://licaishi.sina.com.cn/web/videoLive", "www.yizhibo.com", "z.sina.com.cn"], x)]
         return urls

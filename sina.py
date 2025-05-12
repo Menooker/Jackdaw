@@ -1,6 +1,7 @@
 from concurrent import futures
 import threading
 from typing import Dict, List, Literal, Set
+import lxml
 from waybackpy import WaybackMachineCDXServerAPI
 from tqdm import tqdm
 import requests
@@ -38,6 +39,9 @@ def request(url: str, proxy: Dict[str, str]):
             r.encoding = r.apparent_encoding
             if r.encoding == 'utf-8' or html_has_encoding(r.text):
                 return r
+            if r.text.find('<meta charset="utf-8"', 0, 1000) != -1:
+                r.encoding = 'utf-8'
+                return r
             r.encoding = 'gb2312'
             return r
         except Exception as e:
@@ -73,7 +77,8 @@ def get_main_pages():
 
 def fetch_page_or_fallback(url, fn):
     r = request(get_real_url(url), {})
-    if "<body" not in r.text:
+    isempty = "<body></body>" in r.text or not r.text
+    if "<body" not in r.text or isempty:
         anchor = '<META HTTP-EQUIV="Refresh" CONTENT="0;URL='
         idx = r.text.find(anchor)
         if idx != -1:
@@ -81,7 +86,7 @@ def fetch_page_or_fallback(url, fn):
             redo_url = r.text[idx+len(anchor): idx2]
             print("Redirect to:", redo_url)
             r = request(redo_url, {})
-        elif "<TITLE> 页面没有找到 " in r.text or "<body></body>" in r.text or not r.text:
+        elif "<TITLE> 页面没有找到 " in r.text or isempty:
             r = request(url, proxies)
         else:
             with open(f"out/err_{fn}.html", 'w', encoding="utf-8") as f:
@@ -99,7 +104,7 @@ class Context:
     def __init__(self):
         os.makedirs("out/sina", exist_ok=True)
         self.exec_main = ThreadPoolExecutor(2)
-        self.exec_work = ThreadPoolExecutor(3)
+        self.exec_work = ThreadPoolExecutor(4)
         self.lock = RLock()
         self.mainurls = get_main_pages()
         self.next_url_idx = 0
@@ -218,27 +223,53 @@ class Context:
                         '//div[@class="sina-comment-wrap"]',
                         '//div[@class="page-tools"]',
                         '//div[@class="zhitou-wrap"]',
+                        '//div[@class="artical-player-wrap"]',
+                        '//div[@class="img_wrapper"]',
+                        '//div[@class="xb_new_finance_app"]',
+                        '//span[starts-with(@id,"quote_")]',
+                        '//table',
+                        '//div[@class="finance_app_zqtg finance_lcsds_ds_cls"]',
+                        '//div[@class="seo_data_list"]',
+                        '//div[@class="footer-wrap clearfix"]',
+                        '//div[@class="ct_hqimg"]',
+                        '//div[@data-sudaclick="ad_content_top"]',
                         ])
                     tree = etree.HTML(r.text)
-                    table = tree.xpath('//table[@class="tb01"]')
                     table_text = ""
-                    if len(table) == 1:
-                        table_text = " ".join(table[0].xpath('tbody/tr/td/text()'))
+                    table = tree.xpath('//table')
+                    if table:
+                        tables = [" ".join(telem.xpath('tbody/tr/td//text()')) for telem in table]
+                        table_text = "\n"
+                        table_text += "\n".join(tables)
+                    is_video = tree.xpath('//div[@class="artical-player-wrap"]').__len__() >= 1
                 except Exception as e:
+                    if trimed in self.allowed_short or str(e) == "Document is empty":
+                        with self.lock:
+                            self._on_article_done(trimed, main)
+                        time.sleep(2)
+                        return url
                     with open(f"out/err_{fn}.html", 'w', encoding="utf-8") as f:
                         f.write(r.text)
-                    raise e
+                    ctx._write_bad_page(url, f"{str(e)} Unknown page out/err_{fn}.html")
+                    time.sleep(2)
+                    return "Resume"
                 # patch the data
                 result["content"] = result["content"].replace("[微博]", "")
                 if table_text:
                     result["content"] += "\n" + table_text
                 not_found_str = ["页面没有找到 5秒钟之后将会带", "Wayback Machine"]
                 must_be_ok = ["中国人民银行公开市场业务操作室", "接受组织调查", "正回购",
-                    "省纪委", "逆回购", "今日未进行公开市场操作"]
-                if all_not_in(not_found_str, result["content"]):
+                    "省纪委", "逆回购", "今日未进行公开市场操作", "新华社快讯", "新华社讯",
+                    "责任编辑：张玉洁 SF107", "孙剑嵩", "刘万里 SF014", # 这编辑喜欢发纯图片
+                    "一图", "一张图"
+                    ]
+                must_be_ok_title = ["一图", "一张图"] # 纯图文
+                if all_not_in(not_found_str, result["content"]) and "页面没有找到" != result["title"]:
                     if sum([result["content"].count(x) for x in "，。%；、："]) < 3 \
                         and trimed not in self.allowed_short \
-                        and all_not_in(must_be_ok, result["content"]):
+                        and all_not_in(must_be_ok, result["content"]) \
+                        and all_not_in(must_be_ok_title, result["title"]) \
+                        and not is_video:
                             self._write_bad_page(url, result['content'])
                             time.sleep(2)
                             return "Resume"
@@ -296,6 +327,7 @@ class Context:
                     tree = etree.HTML(r.content)
                 else:
                     raise e
+            
             for parser in self.parsers:
                 parse_cmd = parser.is_it(url, tree, r.text)
                 if parse_cmd == "good":
