@@ -175,7 +175,7 @@ class Context:
             self.bad_content_count += 1
             with open("out/sina/bad_content.txt", 'a', encoding="utf-8") as f:
                 f.write(f">>>>>>>\n{url}\n{content}\n")
-            if self.bad_content_count == 10:
+            if self.bad_content_count == 20:
                 raise RuntimeError(f"Bad content:{url} {content}")
 
 
@@ -373,7 +373,7 @@ def handler(signum, frame):
 
 signal.signal(signal.SIGINT, handler)
 for _ in range(1):
-    for _ in range(9):
+    for _ in range(16):
         ctx.submit_fetch_main()
     while True:
         with ctx.lock:

@@ -8,10 +8,12 @@ class Parser2013_v1:
         for title in tree.xpath("//title/text()"):
             if "新浪财经iPad版" in title:
                 return "skip"
+            if "新浪财经_手机新浪网" in title:
+                return "skip"
         if tree.xpath('//div[@data-sudaclick="blk_newsinter_01"]/ul').__len__() == 1 \
             and tree.xpath('//div[@data-sudaclick="blk_newsinland_01"]/ul').__len__() == 1:
             return "good"
-        if "The Wayback Machine is a" in text:
+        if "The Wayback Machine is an" in text and "response at crawl time" in text:
             return "skip"
         if tree.xpath('//p[@class="submit"]/a[text()="直接回旧版"]'):
             return "skip"
