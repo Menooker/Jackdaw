@@ -37,6 +37,10 @@ def request(url: str, proxy: Dict[str, str]):
         try:
             r = requests.get(url, proxies=proxy, timeout=60)
             r.encoding = r.apparent_encoding
+            if r.text.find("You have sent too many requests in a given amount of time.", 0, 200):
+                print("Too many requests!!! Sleep 128 sec")
+                time.sleep(128)
+                continue
             if r.encoding == 'utf-8' or html_has_encoding(r.text):
                 return r
             if r.text.find('<meta charset="utf-8"', 0, 1000) != -1:
@@ -343,6 +347,9 @@ class Context:
                     break
             else:
                 print(f"Bad main and try to resume:{url}")
+                fn = trim_main_url(url).replace(":", "-.").replace("/", "--")
+                with open(f"out/err_main_{fn}.html", 'w', encoding="utf-8") as f:
+                    f.write(r.text)
                 self._write_bad_page(url, "main")
                 time.sleep(10)
                 return "Resume"
