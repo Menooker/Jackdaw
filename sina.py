@@ -37,7 +37,7 @@ def request(url: str, proxy: Dict[str, str]):
         try:
             r = requests.get(url, proxies=proxy, timeout=60)
             r.encoding = r.apparent_encoding
-            if r.text.find("You have sent too many requests in a given amount of time.", 0, 200):
+            if r.text.find("You have sent too many requests in a given amount of time.", 0, 200) != -1:
                 print("Too many requests!!! Sleep 128 sec")
                 time.sleep(128)
                 continue
