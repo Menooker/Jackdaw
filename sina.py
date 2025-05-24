@@ -124,7 +124,7 @@ class Context:
         self.ziplock = Lock()
         self.allowed_short = file_to_list("out/sina/allow_short.txt")
         self.bad_content_count = 0
-        self.parsers = [Parser2013_v1, Parser2012_v3, Parser2012_v1, Parser2012_v2]
+        self.parsers = [Parser2024_v1, Parser2013_v1, Parser2012_v3, Parser2012_v1, Parser2012_v2]
         with open("out/sina/bad_content.txt", 'a') as f:
             f.write("=======\n")
 
@@ -237,6 +237,10 @@ class Context:
                         '//div[@class="footer-wrap clearfix"]',
                         '//div[@class="ct_hqimg"]',
                         '//div[@data-sudaclick="ad_content_top"]',
+                        '//div[@class="blk-wxfollow clearfix"]',
+                        '//blockquote[@class="fin_reference"]',
+                        '//div[@class="clearfix appendQr_wrap"]',
+                        '//div[@class="article"]//font[@cms-style="font-L"]',
                         ])
                     tree = etree.HTML(r.text)
                     table_text = ""
@@ -245,6 +249,9 @@ class Context:
                         tables = [" ".join(telem.xpath('tbody/tr/td//text()')) for telem in table]
                         table_text = "\n"
                         table_text += "\n".join(tables)
+                    arit_p = tree.xpath('//div[@class="article"]//font[@cms-style="font-L"]//text()')
+                    if arit_p:
+                        table_text += "\n".join(arit_p)
                     is_video = tree.xpath('//div[@class="artical-player-wrap"]').__len__() >= 1
                 except Exception as e:
                     if trimed in self.allowed_short or str(e) == "Document is empty":
@@ -261,7 +268,7 @@ class Context:
                 result["content"] = result["content"].replace("[微博]", "")
                 if table_text:
                     result["content"] += "\n" + table_text
-                not_found_str = ["页面没有找到 5秒钟之后将会带", "Wayback Machine"]
+                not_found_str = ["页面没有找到 5秒钟之后将会带", "Wayback Machine", "页面找不到了"]
                 must_be_ok = ["中国人民银行公开市场业务操作室", "接受组织调查", "正回购",
                     "省纪委", "逆回购", "今日未进行公开市场操作", "新华社快讯", "新华社讯",
                     "责任编辑：张玉洁 SF107", "孙剑嵩", "刘万里 SF014", # 这编辑喜欢发纯图片
@@ -333,6 +340,8 @@ class Context:
                     raise e
             
             for parser in self.parsers:
+                if tree is None:
+                    continue
                 parse_cmd = parser.is_it(url, tree, r.text)
                 if parse_cmd == "good":
                     urls = parser.parse(url, tree)
@@ -351,9 +360,9 @@ class Context:
                 with open(f"out/err_main_{fn}.html", 'w', encoding="utf-8") as f:
                     f.write(r.text)
                 self._write_bad_page(url, "main")
-                time.sleep(10)
+                time.sleep(7)
                 return "Resume"
-            time.sleep(10)
+            time.sleep(7)
             return url
         except:
             traceback.print_exc()
