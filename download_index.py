@@ -17,6 +17,7 @@ import signal
 import zipfile
 from Jackdaw.Utils import get_real_url, trim_article_url, trim_main_url, all_not_in
 from Jackdaw.Parser import *
+import argparse
 
 def html_has_encoding(text: str) -> bool:
     if text.startswith('<?xml version="1.0" encoding="'):
@@ -50,16 +51,16 @@ def file_to_list(cache_dir):
     return []
 
 
-def get_main_pages_impl(url) -> List[str]:
+def get_main_pages_impl(url, start_timestamp, end_timestamp) -> List[str]:
     user_agent = "Mozilla/5.0 (Windows NT 5.1; rv:40.0) Gecko/20100101 Firefox/40.0"
-    cdx = WaybackMachineCDXServerAPI(url, user_agent, start_timestamp=2012, end_timestamp=2020)
-    urls = [item.archive_url for item in tqdm(cdx.snapshots())]
+    cdx = WaybackMachineCDXServerAPI(url, user_agent, start_timestamp=start_timestamp, end_timestamp=end_timestamp)
+    urls = [item.archive_url for item in tqdm(cdx.snapshots()) if item.statuscode == "200"]
     return urls
 
-def get_main_pages(name, url):
+def get_main_pages(name, url, start_timestamp, end_timestamp):
     cache_dir = f"out/{name}/mainpages.txt"
     if not os.path.exists(cache_dir):
-        urls = get_main_pages_impl(url)
+        urls = get_main_pages_impl(url, start_timestamp, end_timestamp)
         with open(cache_dir, 'w') as f:
             f.write("\n".join(urls))
         return urls
@@ -68,11 +69,11 @@ def get_main_pages(name, url):
 
 
 class Context:
-    def __init__(self, name, url):
+    def __init__(self, name, url, start_timestamp, end_timestamp):
         os.makedirs(f"out/{name}", exist_ok=True)
         self.exec_main = ThreadPoolExecutor(2)
         self.lock = RLock()
-        self.mainurls = get_main_pages(name, url)
+        self.mainurls = get_main_pages(name, url, start_timestamp, end_timestamp)
         self.next_url_idx = 0
         main_path = f"out/{name}/main.txt"
         self.done_main: Set[str] = set(file_to_list(main_path))
@@ -159,66 +160,77 @@ class Context:
                     continue
                 self.main_fut.add(self.exec_main.submit(self._task_main_page, self.mainurls[cur]))
 
+def main(name, url, start_timestamp, end_timestamp):
+    ctx = Context(name, url, start_timestamp, end_timestamp)
+    def handler(signum, frame):
+        print("ctrl+c")
+        ctx.close()
+        print("Num bad contents", ctx.bad_content_count)
+        exit(2)
 
-ctx = Context("wsl-page-news-china", "https://online.wsj.com/public/page/news-china.html")
-def handler(signum, frame):
-    print("ctrl+c")
-    ctx.close()
-    print("Num bad contents", ctx.bad_content_count)
-    exit(2)
-
-signal.signal(signal.SIGINT, handler)
-for _ in range(1):
-    for _ in range(16):
-        ctx.submit_fetch_main()
-    while True:
-        with ctx.lock:
-            futs = list(ctx.main_fut)
-        if len(futs) == 0:
-            print("Done")
-            break
-        try:
-            results = futures.wait(futs, return_when="FIRST_COMPLETED", timeout=5)
-        except TimeoutError:
-            continue
-        for fut in results.done:
-            if fut.done():
-                ret = fut.result()
-                print("index", ret)
-            else:
-                ret = None
-            if ret is None:
-                ctx.close()
-                print("Error occured, exiting")
-                exit(2)
+    signal.signal(signal.SIGINT, handler)
+    for _ in range(1):
+        for _ in range(16):
+            ctx.submit_fetch_main()
+        while True:
             with ctx.lock:
-                ctx.main_fut.remove(fut)
+                futs = list(ctx.main_fut)
+            if len(futs) == 0:
+                print("Done")
+                break
+            try:
+                results = futures.wait(futs, return_when="FIRST_COMPLETED", timeout=5)
+            except TimeoutError:
+                continue
+            for fut in results.done:
+                if fut.done():
+                    ret = fut.result()
+                    print("index", ret)
+                else:
+                    ret = None
+                if ret is None:
+                    ctx.close()
+                    print("Error occured, exiting")
+                    exit(2)
+                with ctx.lock:
+                    ctx.main_fut.remove(fut)
 
-print("Num bad contents", ctx.bad_content_count)
-ctx.close()
-    # def parse_2012(self, url: str, tree):
-    #     news_src_url = tree.xpath('//ul[@id="S_Cont_06_01"]/script[@type="text/javascript"]/@src')
-    #     if news_src_url.__len__() != 1:
-    #         raise RuntimeError("parse 2012 failed: "+ url)
+    print("Num bad contents", ctx.bad_content_count)
+    ctx.close()
 
-    #     r = requests.get(news_src_url[0])
-    #     start = "var all_1_data ="
-    #     end = ";"
-    #     sidx = r.text.find(start)
-    #     if sidx == -1:
-    #         raise RuntimeError("parse 2012 JS: "+ news_src_url[0])
-    #     eidx = r.text.find(end, sidx)
-    #     if eidx == -1:
-    #         raise RuntimeError("parse 2012 JS: "+ news_src_url[0])
-    #     data = json.loads(r.text[sidx + len(start): eidx])
-    #     inner = data['data']
-    #     length = len(inner)
+if __name__ == "__main__":
 
-    #     news_src_url = tree.xpath('//ul[@id="S_Cont_06_02"]/li/a/href')
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--url", type=str, required=True)
+    parser.add_argument("--name", type=str, required=True)
+    parser.add_argument("--start", type=int, required=True)
+    parser.add_argument("--end", type=int, required=True)
 
-    #     page = MainPage(trim_main_url(url, length))
-    #     for obj in inner:
-    #         self.submit_fetch_article(obj['url'], page)
+    args = parser.parse_args()
+    main(args.name, args.url, args.start, args.end)
+# def parse_2012(self, url: str, tree):
+#     news_src_url = tree.xpath('//ul[@id="S_Cont_06_01"]/script[@type="text/javascript"]/@src')
+#     if news_src_url.__len__() != 1:
+#         raise RuntimeError("parse 2012 failed: "+ url)
+
+#     r = requests.get(news_src_url[0])
+#     start = "var all_1_data ="
+#     end = ";"
+#     sidx = r.text.find(start)
+#     if sidx == -1:
+#         raise RuntimeError("parse 2012 JS: "+ news_src_url[0])
+#     eidx = r.text.find(end, sidx)
+#     if eidx == -1:
+#         raise RuntimeError("parse 2012 JS: "+ news_src_url[0])
+#     data = json.loads(r.text[sidx + len(start): eidx])
+#     inner = data['data']
+#     length = len(inner)
+
+#     news_src_url = tree.xpath('//ul[@id="S_Cont_06_02"]/li/a/href')
+
+#     page = MainPage(trim_main_url(url, length))
+#     for obj in inner:
+#         self.submit_fetch_article(obj['url'], page)
     
 # def main():
     
