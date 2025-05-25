@@ -14,10 +14,11 @@ import traceback
 from datetime import datetime
 import time
 import signal
-import zipfile
+import tarfile
 from Jackdaw.Utils import get_real_url, trim_article_url, trim_main_url, all_not_in
 from Jackdaw.Parser import *
 import argparse
+import io
 
 def html_has_encoding(text: str) -> bool:
     if text.startswith('<?xml version="1.0" encoding="'):
@@ -67,6 +68,13 @@ def get_main_pages(name, url, start_timestamp, end_timestamp):
     with open(cache_dir, 'r') as f:
         return f.read().split("\n")
 
+def add_string_to_tar(tar: tarfile.TarFile, content: str, filename: str):
+    data = content.encode('utf-8')
+    fileobj = io.BytesIO(data)
+    tarinfo = tarfile.TarInfo(name=filename)
+    tarinfo.size = len(data)
+    tarinfo.mtime = datetime.now().timestamp()
+    tar.addfile(tarinfo, fileobj)
 
 class Context:
     def __init__(self, name, url, start_timestamp, end_timestamp):
@@ -79,7 +87,14 @@ class Context:
         self.done_main: Set[str] = set(file_to_list(main_path))
         self.done_main_log = open(main_path, 'a')
         self.main_fut: Set[Future] = set()
-        self.outzip = zipfile.ZipFile(f"out/{name}.zip", 'a', compression=zipfile.ZIP_LZMA)
+        fidx = 0
+        for i in range(100):
+            if not os.path.exists(f"out/{name}_{i}.tar.xz"):
+                fidx = i
+                break
+        else:
+            raise RuntimeError("Cannot find a valid file name")
+        self.outzip = tarfile.open(f"out/{name}_{fidx}.tar.xz", 'x:xz', encoding="utf-8")
         self.ziplock = Lock()
         self.bad_content_count = 0
         self.name = name
@@ -139,8 +154,7 @@ class Context:
             else:
                 path = f"{pageid}.html"
                 with self.ziplock:
-                    self.outzip.writestr(path, r.text)
-                    self.outzip.fp.flush()
+                    add_string_to_tar(self.outzip, r.text, path)
             with self.lock:
                 self._on_main_done(pageid)
             time.sleep(7)
