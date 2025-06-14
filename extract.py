@@ -1,6 +1,7 @@
 from io import TextIOWrapper
 import tarfile
 from datetime import datetime, timedelta
+from unicodedata import bidirectional
 import pytz
 from lxml import etree
 from dataclasses import dataclass
@@ -11,14 +12,16 @@ import zipfile
 from tqdm import tqdm
 from Jackdaw.Parser.Utils import Document, doassert, doassert_or_empty_str, doassert_single, datetime_to_timestamp, timestamp_to_datetime, ny_to_shanghai_time
 from Jackdaw.Parser.Utils import beijing, gmt_timestamp_to_shanghai_time
-from Jackdaw.Parser.wsj import parse_wsj_news_world_china_2015, parse_wsj_world_china_2023
+from Jackdaw.Parser.wsj import parse_wsj_news_world_china_2015, parse_wsj_world_china_2023, \
+    parse_wsj_page_news_china_2015,parser_wsj_news_types_china_news
+from Jackdaw.Parser.bloomberg import parse_bloomberg_topics_china_2015, parse_bloomberg_news_china_2012, parse_bloomberg_next_china_2019
 
 
 class Buffer:
     def __init__(self, logf: TextIOWrapper, zipf: zipfile.ZipFile) -> None:
         self.docs: List[Document] = []
         self.logs: List[str] = []
-        self.filename = ""
+        self.filename = "init.txt"
         self.logf = logf
         self.zipf = zipf
 
@@ -54,22 +57,32 @@ class Buffer:
         
 class ReorderBuffer:
     def __init__(self) -> None:
-        self.buffer: Dict[str, str] = dict()
+        self.buffer: Dict[str, List[str]] = dict()
     def get(self, tarf: tarfile.TarFile, name: str) -> str:
         if name in self.buffer:
-            ret = self.buffer[name]
-            del self.buffer[name]
+            retlist = self.buffer[name]
+            ret = retlist.pop()
+            if len(retlist) == 0:
+                del self.buffer[name]
             return ret
-        for _ in range(100):
-            nxt = tarf.next()
+        for _ in range(200):
+            try:
+                nxt = tarf.next()
+            except EOFError:
+                print("EOF error")
+                nxt = None
             if not nxt:
                 print("warn cannot find file "+ name)
                 return
-            with tarf.extractfile(nxt) as file:
-                contents = file.read().decode("utf-8")
+            try:
+                with tarf.extractfile(nxt) as file:
+                    contents = file.read().decode("utf-8")
+            except EOFError:
+                print("EOF error")
+                return
             if name == nxt.name:
                 return contents
-            self.buffer[nxt.name] = contents
+            self.buffer[nxt.name] = [contents]
         else:
             print("warn cannot find file "+ name)
 
@@ -97,15 +110,32 @@ class Context:
         logf = open(logpath, 'a', encoding="utf-8")
         zipf = zipfile.ZipFile(f"out/{name}_extract.zip", 'a', compression=zipfile.ZIP_LZMA)
         self.buffer = Buffer(logf, zipf)
-    def enumerate_files(self, tgz_path: str, parser):
-        with tarfile.open(tgz_path, 'r:xz') as f:
-            members = f.getmembers()
-            members = sorted(members, key = lambda m: m.name)
+    def enumerate_files(self, tgz_path: str, parser, badids: List[str]):
+        filename_cache_path = tgz_path + ".list.txt"
+        if os.path.exists(filename_cache_path):
+            with open(filename_cache_path, "r", encoding="utf-8") as f:
+                members = [line.strip() for line in f.readlines()]
+        else:
+            with tarfile.open(tgz_path, 'r:xz') as f:
+                members = []
+                while True:
+                    try:
+                        nxt = f.next()
+                    except EOFError:
+                        nxt = None
+                        print("EOF error")
+                    if nxt:
+                        members.append(nxt.name)
+                    else:
+                        break
+                members = sorted(members)
+            with open(filename_cache_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(members))
         with tarfile.open(tgz_path, 'r:xz') as f:
             rob = ReorderBuffer()
             # while next:
             for next in tqdm(members):
-                fn = next.name
+                fn = next
                 contents = rob.get(f, fn)
                 if fn in self.donefile:
                     continue
@@ -113,6 +143,14 @@ class Context:
                     continue
                 if "No recent results have been found." in contents:
                     # next = f.next()
+                    continue
+                if contents.find("503 Service Unavailable", 0, 1000) != -1:
+                    continue
+                if contents.find("<title>Wayback Machine</title>", 0, 500) != -1:
+                    continue
+                if contents.find("We've detected unusual activity from your computer network", 2000, 20000) != -1:
+                    continue
+                if any(map(lambda x: contents.find(x, 0, 1000) != -1,  badids)):
                     continue
                 try:
                     snapshot_date = gmt_timestamp_to_shanghai_time(fn[:len(snapshot_example)])
@@ -134,9 +172,9 @@ class Context:
                     with open("out/err.html", 'w', encoding="utf-8") as outf:
                         outf.write(contents)
                     raise e
-    def work(self, numfiles: int, parser):
-        for i in range(numfiles):
-            ctx.enumerate_files(f"out/{self.name}_{i}.tar.xz", parser)
+    def work(self, numfiles: int, parser, startfile: int = 0, badids: List[str] = []):
+        for i in range(startfile, numfiles):
+            ctx.enumerate_files(f"out/{self.name}_{i}.tar.xz", parser, badids)
         ctx.buffer.close()
         logpath = f"out/{self.name}_extract_log.txt"
         with open(logpath, 'r', encoding="utf-8") as logf:
@@ -147,5 +185,17 @@ class Context:
 
 # ctx = Context("wsj-news-world-china")
 # thees = ctx.work(1, parse_wsj_news_world_china_2015)
-ctx = Context("wsj-world-china")
-thees = ctx.work(1, parse_wsj_world_china_2023)
+# ctx = Context("wsj-world-china")
+# thees = ctx.work(1, parse_wsj_world_china_2023)
+# ctx = Context("wsj-page-news-china")
+# thees = ctx.work(1, parse_wsj_page_news_china_2015)
+# ctx = Context("wsj-news-types-china-news")
+# thees = ctx.work(3, parser_wsj_news_types_china_news, 0, badids=["20180131024848", "20180202084856", "20190207080113", "20190711050951"])
+# ctx = Context("bloomberg-topics-china")
+# thees = ctx.work(1, parse_bloomberg_topics_china_2015)
+# ctx = Context("bloomberg-news-china")
+# thees = ctx.work(1, parse_bloomberg_news_china_2012)
+# ctx = Context("bloomberg-next-china")
+# thees = ctx.work(1, parse_bloomberg_next_china_2019)
+ctx = Context("wsj-public-page-news-china2")
+thees = ctx.work(1, parse_wsj_page_news_china_2015)

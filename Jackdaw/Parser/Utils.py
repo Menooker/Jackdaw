@@ -1,6 +1,7 @@
 from datetime import timedelta, datetime
 from zoneinfo import ZoneInfo
 from dataclasses import dataclass
+from typing import List
 def doassert(b, err):
     if not b:
         raise RuntimeError(err)
@@ -46,3 +47,17 @@ class Document:
     content: str
     url: str
 
+def clean_url(link: str, wsj_link_head: List[str]) -> str:
+    for linkhead in wsj_link_head:
+        link_idx = link.find(linkhead)
+        if link_idx != -1:
+            link_idx = link_idx+len(linkhead)
+            break
+    doassert(link_idx!=-1, "bad link:"+link)
+    short_link = link[link_idx:]
+    idx = short_link.find("?")
+    if idx != -1:
+        short_link = short_link[:idx]
+    if short_link[-1] == "/":
+        short_link=short_link[:-1]
+    return short_link
